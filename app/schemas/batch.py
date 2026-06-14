@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -26,6 +27,14 @@ class BatchProcessRequest(BaseModel):
         return [v.strip() for v in self.name_variations.split(",") if v.strip()]
 
 
+class JobStartedResponse(BaseModel):
+    job_id: UUID
+    status: str = "queued"
+    batch_number: UUID
+    total_episodes: int
+    message: str
+
+
 class EpisodeResult(BaseModel):
     episode_id: str
     title: str | None
@@ -35,9 +44,26 @@ class EpisodeResult(BaseModel):
     confidence_score: int | None = Field(None, ge=0, le=100)
     reason: str | None
     status: str = Field(..., description="processed | skipped | error")
-    error: str | None = None
 
 
+class JobStatusResponse(BaseModel):
+    job_id: UUID
+    batch_number: UUID
+    person_name: str
+    status: str = Field(..., description="queued | running | completed | failed")
+    total_episodes: int
+    processed: int
+    skipped: int
+    errors: int
+    progress_pct: float
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime | None
+    error_message: str | None = None
+    results: list[EpisodeResult] | None = None
+
+
+# Kept for backward compatibility with the sync endpoint
 class BatchProcessResponse(BaseModel):
     batch_number: str
     person_name: str

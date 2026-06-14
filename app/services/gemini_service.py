@@ -8,11 +8,13 @@ from functools import partial
 import httpx
 from google import genai
 from google.genai import types
-from tenacity import retry, stop_after_attempt, wait_exponential
+from google.genai.errors import ClientError
+from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
+FALLBACK_MINUTES = 10  # analyse only the first N minutes when full video is too large
 
 
 def _build_prompt(person_name: str, name_variations: list[str]) -> str:
@@ -43,6 +45,18 @@ Rules:
 - "confidence_score" reflects your overall confidence in the full assessment (0 = no confidence, 100 = certain)"""
 
 
+def _is_token_limit_error(exc: ClientError) -> bool:
+    msg = str(exc).lower()
+    return "token" in msg and ("exceeds" in msg or "limit" in msg)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Only retry on transient errors (rate limit / server error), not on 4xx."""
+    if isinstance(exc, ClientError):
+        return exc.status_code in (429, 500, 502, 503, 504)
+    return True
+
+
 def _extract_json(text: str) -> dict:
     text = text.strip()
 
@@ -70,53 +84,96 @@ class GeminiService:
     def __init__(self):
         self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def analyze_youtube(
         self,
         video_url: str,
         person_name: str,
         name_variations: list[str],
     ) -> dict:
-        """Pass YouTube URL directly to Gemini — no download needed."""
+        """Analyse the first FALLBACK_MINUTES minutes of a YouTube video.
+        Capping upfront avoids token-limit errors and keeps response times short —
+        the opening segment of any podcast is sufficient for detection + role ID."""
+        return await self._call_youtube(
+            video_url, person_name, name_variations,
+            end_offset=f"{FALLBACK_MINUTES * 60}s",
+        )
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+    )
+    async def _call_youtube(
+        self,
+        video_url: str,
+        person_name: str,
+        name_variations: list[str],
+        end_offset: str | None = None,
+    ) -> dict:
         prompt = _build_prompt(person_name, name_variations)
+
+        video_part = types.Part(
+            file_data=types.FileData(file_uri=video_url, mime_type="video/*"),
+            video_metadata=types.VideoMetadata(end_offset=end_offset) if end_offset else None,
+        )
 
         response = await self.client.aio.models.generate_content(
             model=MODEL,
-            contents=[
-                types.Part.from_uri(file_uri=video_url, mime_type="video/*"),
-                types.Part.from_text(text=prompt),
-            ],
+            contents=[video_part, types.Part.from_text(text=prompt)],
         )
         return _extract_json(response.text)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def analyze_audio_url(
         self,
         audio_url: str,
         person_name: str,
         name_variations: list[str],
     ) -> dict:
+        """Download audio, upload to Gemini File API, analyze.
+        Falls back to first FALLBACK_MINUTES minutes if too large."""
+        try:
+            return await self._call_audio(audio_url, person_name, name_variations)
+        except ClientError as exc:
+            if _is_token_limit_error(exc):
+                return await self._call_audio(
+                    audio_url, person_name, name_variations,
+                    max_bytes=FALLBACK_MINUTES * 60 * 16_000,  # ~10MB for typical podcast
+                )
+            raise
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+    )
+    async def _call_audio(
+        self,
+        audio_url: str,
+        person_name: str,
+        name_variations: list[str],
+        max_bytes: int | None = None,
+    ) -> dict:
         """Download audio from URL, upload to Gemini File API, then analyze."""
         prompt = _build_prompt(person_name, name_variations)
 
-        # Download audio bytes
         async with httpx.AsyncClient(timeout=120) as http:
             resp = await http.get(audio_url, follow_redirects=True)
             resp.raise_for_status()
             audio_bytes = resp.content
 
-        # Detect mime type from Content-Type header or URL extension
+        if max_bytes:
+            audio_bytes = audio_bytes[:max_bytes]
+
         content_type = resp.headers.get("content-type", "audio/mpeg").split(";")[0].strip()
         suffix = ".mp3" if "mpeg" in content_type else ".m4a"
 
-        # Write to temp file and upload via Gemini File API (sync call → thread pool)
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
             tmp_path = f.name
 
         try:
             upload_fn = partial(self.client.files.upload, file=tmp_path)
-            uploaded = await asyncio.get_event_loop().run_in_executor(None, upload_fn)
+            uploaded = await asyncio.get_running_loop().run_in_executor(None, upload_fn)
 
             response = await self.client.aio.models.generate_content(
                 model=MODEL,
