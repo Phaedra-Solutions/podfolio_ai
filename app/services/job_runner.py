@@ -77,6 +77,8 @@ async def _run(job_id: UUID) -> None:
     processed = skipped = errors = 0
 
     for record in records:
+        # Mark episode as "processing" before the Gemini call
+        await _set_episode_status(record["id"], "processing")
         ep_result = await _process_record(gemini, record, person_name, name_variations)
         results.append(ep_result)
 
@@ -124,16 +126,19 @@ async def _process_record(
         if source == "YOUTUBE":
             url = record["video_link"]
             if not url:
+                await _set_episode_status(record["id"], "error")
                 return _skip(episode_id, title, source, "No videoLink available")
             analysis = await gemini.analyze_youtube(url, person_name, name_variations)
         else:
             url = record["audio_link"]
             if not url:
+                await _set_episode_status(record["id"], "error")
                 return _skip(episode_id, title, source, f"No audioLink for source '{source}'")
             analysis = await gemini.analyze_audio_url(url, person_name, name_variations)
     except Exception as exc:
         from tenacity import RetryError
         cause = exc.__cause__ if isinstance(exc, RetryError) else exc
+        await _set_episode_status(record["id"], "error")
         return {
             "episode_id": episode_id, "title": title, "source": source,
             "is_podcast": None, "role": None, "confidence_score": None,
@@ -154,30 +159,45 @@ async def _process_record(
     }
 
 
+async def _set_episode_status(episode_id, status: str) -> None:
+    """Lightweight update — just flips processingStatus."""
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            text('UPDATE episodes SET "processingStatus" = :s WHERE id = :id'),
+            {"s": status, "id": episode_id},
+        )
+        await db.commit()
+
+
 async def _update_episode(record: dict, analysis: dict) -> None:
     now = datetime.now(timezone.utc)
+    is_podcast = analysis.get("is_podcast", False)
+    processing_status = "verified" if is_podcast else "rejected"
+
     new_meta = {
         **record["meta"],
         "role": analysis.get("role"),
-        "isPodcast": analysis.get("is_podcast"),
+        "isPodcast": is_podcast,
         "processedAt": now.isoformat(),
     }
     async with AsyncSessionLocal() as db:
         await db.execute(
             text("""
                 UPDATE episodes SET
-                    "isAIVerified"     = :is_verified,
-                    "aiVerifiedReason" = :reason,
-                    "confidenceScore"  = :score,
-                    metadata           = :meta,
-                    updated_at         = :updated_at
+                    "isAIVerified"       = :is_verified,
+                    "aiVerifiedReason"   = :reason,
+                    "confidenceScore"    = :score,
+                    metadata             = :meta,
+                    "processingStatus"   = :processing_status,
+                    updated_at           = :updated_at
                 WHERE id = :id
             """),
             {
-                "is_verified": analysis.get("is_podcast", False),
+                "is_verified": is_podcast,
                 "reason": analysis.get("reason", ""),
                 "score": analysis.get("confidence_score"),
                 "meta": json.dumps(new_meta),
+                "processing_status": processing_status,
                 "updated_at": now,
                 "id": record["id"],
             },

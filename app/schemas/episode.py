@@ -28,6 +28,7 @@ class EpisodeSchema(BaseModel):
     favoriteCount: str | None = None
     commentCount: str | None = None
     batchNumber: UUID | None = None
+    processingStatus: str = "pending"
 
     model_config = {"from_attributes": True}
 

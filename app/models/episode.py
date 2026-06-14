@@ -30,3 +30,5 @@ class Episode(Base):
     favoriteCount = Column(Text)
     commentCount = Column(Text)
     batchNumber = Column(UUID(as_uuid=True))
+    # pending | processing | verified | rejected | error
+    processingStatus = Column(Text, nullable=False, default="pending")

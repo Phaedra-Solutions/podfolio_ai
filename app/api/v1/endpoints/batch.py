@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -26,10 +26,14 @@ async def start_batch_process(
 ):
     """
     Start a background job that processes all episodes in the batch.
-    Returns immediately with a job_id — use GET /batch-jobs/{job_id} to
+
+    person_name and name_variations are resolved automatically from the
+    profile linked to the episodes — no need to pass them manually.
+
+    Returns immediately with a job_id. Use GET /batch-jobs/{job_id} to
     track progress.
     """
-    # Count episodes upfront so we can report total immediately
+    # ── 1. Count episodes ───────────────────────────────────────────────────
     count_result = await db.execute(
         select(func.count()).select_from(Episode).where(
             Episode.batchNumber == payload.batch_number
@@ -43,12 +47,41 @@ async def start_batch_process(
             detail=f"No episodes found for batch_number {payload.batch_number}",
         )
 
-    # Create the job record
+    # ── 2. Resolve profile → person_name + nameVariations ──────────────────
+    # Grab the profileId from the first episode in this batch
+    ep_result = await db.execute(
+        select(Episode.profileId).where(
+            Episode.batchNumber == payload.batch_number
+        ).limit(1)
+    )
+    profile_id = ep_result.scalar_one_or_none()
+
+    person_name: str = ""
+    name_variations: str = ""
+
+    if profile_id:
+        profile_result = await db.execute(
+            text('SELECT name, "nameVariations" FROM profiles WHERE id = :pid'),
+            {"pid": profile_id},
+        )
+        profile_row = profile_result.mappings().fetchone()
+        if profile_row:
+            person_name = profile_row["name"] or ""
+            name_variations = profile_row["nameVariations"] or ""
+
+    if not person_name:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not resolve person_name from the profile linked to this batch. "
+                   "Ensure the episodes have a valid profileId with a name set.",
+        )
+
+    # ── 3. Create the job record ─────────────────────────────────────────────
     job = BatchJob(
         id=uuid.uuid4(),
         batch_number=payload.batch_number,
-        person_name=payload.person_name,
-        name_variations=payload.name_variations,
+        person_name=person_name,
+        name_variations=name_variations,
         youtube_api_key=payload.youtube_api_key,
         listen_notes_api_key=payload.listen_notes_api_key,
         status="queued",
@@ -62,7 +95,7 @@ async def start_batch_process(
     db.add(job)
     await db.commit()
 
-    # Fire and forget — runs in the background without blocking
+    # ── 4. Fire background task ──────────────────────────────────────────────
     asyncio.create_task(job_runner.start_job(job.id))
 
     return JobStartedResponse(
@@ -70,8 +103,11 @@ async def start_batch_process(
         status="queued",
         batch_number=payload.batch_number,
         total_episodes=total,
-        message=f"Job queued. {total} episodes will be processed in the background. "
-                f"Poll GET /api/v1/episodes/batch-jobs/{job.id} to track progress.",
+        message=(
+            f"Job queued for '{person_name}'. "
+            f"{total} episodes will be processed in the background. "
+            f"Poll GET /api/v1/episodes/batch-jobs/{job.id} to track progress."
+        ),
     )
 
 
