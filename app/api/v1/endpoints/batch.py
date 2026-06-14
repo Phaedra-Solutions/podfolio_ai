@@ -106,24 +106,30 @@ async def start_batch_process(
         message=(
             f"Job queued for '{person_name}'. "
             f"{total} episodes will be processed in the background. "
-            f"Poll GET /api/v1/episodes/batch-jobs/{job.id} to track progress."
+            f"Poll GET /api/v1/episodes/batch-jobs/{payload.batch_number} to track progress."
         ),
     )
 
 
-@router.get("/batch-jobs/{job_id}", response_model=JobStatusResponse)
+@router.get("/batch-jobs/{batch_number}", response_model=JobStatusResponse)
 async def get_job_status(
-    job_id: uuid.UUID,
+    batch_number: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get the current status and progress of a batch processing job.
+    Get the current status and progress of a batch processing job by batch_number.
+    Returns the most recent job for that batch.
     """
-    result = await db.execute(select(BatchJob).where(BatchJob.id == job_id))
+    result = await db.execute(
+        select(BatchJob)
+        .where(BatchJob.batch_number == batch_number)
+        .order_by(BatchJob.created_at.desc())
+        .limit(1)
+    )
     job = result.scalar_one_or_none()
 
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail="No job found for this batch_number")
 
     total = job.total_episodes or 0
     done = (job.processed or 0) + (job.skipped or 0) + (job.errors or 0)
