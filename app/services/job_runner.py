@@ -60,7 +60,9 @@ async def _run(job_id: UUID) -> None:
             {
                 "id": ep.id,
                 "id_str": str(ep.id),
-                "title": ep.title,
+                "title": ep.title or "",
+                "channel": ep.channel or "",
+                "description": ep.description or "",
                 "source": (ep.source or "YOUTUBE").upper(),
                 "video_link": ep.videoLink,
                 "audio_link": ep.audioLink,
@@ -115,34 +117,68 @@ async def _run(job_id: UUID) -> None:
     logger.info("Job %s completed — %d processed, %d skipped, %d errors", job_id, processed, skipped, errors)
 
 
-_LN_WEB_RE = re.compile(r"listennotes\.com/podcasts/[^/]+/[^/]+-([A-Za-z0-9_-]+)/?")
-_LN_API = "https://listen-api.listennotes.com/api/v2/episodes/{ep_id}"
+_LN_PODCASTS_RE = re.compile(r"listennotes\.com/podcasts/[^/]+/[^/]+-([A-Za-z0-9_-]+)/?")
+_LN_E_RE = re.compile(r"listennotes\.com/e/([A-Za-z0-9_-]+)/?")
+_LN_API_BASE = "https://listen-api.listennotes.com/api/v2"
 
 
 async def _resolve_audio_url(raw_url: str, ln_api_key: str) -> str:
     """
-    If raw_url is a Listen Notes web-page URL (returns 403 on direct download),
-    extract the episode ID and call the Listen Notes API to get the real audio URL.
+    If raw_url is a Listen Notes web-page URL:
+      1. Extract the episode ID from the URL (supports both /podcasts/ and /e/ formats).
+      2. Call the Listen Notes API to get the real audio URL.
+      3. If the API is unreachable, fall back to yt-dlp.
     Otherwise return raw_url unchanged.
     """
-    m = _LN_WEB_RE.search(raw_url)
+    m = _LN_PODCASTS_RE.search(raw_url) or _LN_E_RE.search(raw_url)
     if not m:
         return raw_url  # Already a direct audio URL
 
     ep_id = m.group(1)
-    api_url = _LN_API.format(ep_id=ep_id)
+    api_url = f"{_LN_API_BASE}/episodes/{ep_id}"
 
-    async with httpx.AsyncClient(timeout=30) as http:
-        resp = await http.get(api_url, headers={"X-ListenAPI-Key": ln_api_key})
-        resp.raise_for_status()
-        data = resp.json()
+    # ── Try Listen Notes API first ───────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.get(api_url, headers={"X-ListenAPI-Key": ln_api_key})
+            resp.raise_for_status()
+            data = resp.json()
 
-    audio = data.get("audio") or data.get("audio_url")
-    if not audio:
-        raise ValueError(f"Listen Notes API returned no audio URL for episode {ep_id}")
+        audio = data.get("audio") or data.get("audio_url")
+        if audio:
+            logger.info("Resolved Listen Notes episode %s via API → %s", ep_id, audio)
+            return audio
+        raise ValueError("Listen Notes API returned no audio field")
 
-    logger.info("Resolved Listen Notes episode %s → %s", ep_id, audio)
-    return audio
+    except Exception as api_exc:
+        logger.warning(
+            "Listen Notes API failed for episode %s (%s) — falling back to yt-dlp",
+            ep_id, api_exc,
+        )
+
+    # ── Fallback: yt-dlp ─────────────────────────────────────────────────────
+    loop = asyncio.get_running_loop()
+
+    def _extract():
+        import yt_dlp  # noqa: PLC0415
+
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(raw_url, download=False)
+            if "url" in info:
+                return info["url"]
+            if "entries" in info:
+                return info["entries"][0]["url"]
+            raise ValueError("yt-dlp could not extract an audio URL")
+
+    try:
+        audio_url = await loop.run_in_executor(None, _extract)
+        logger.info("Resolved Listen Notes episode %s via yt-dlp → %s", ep_id, audio_url)
+        return audio_url
+    except Exception as yt_exc:
+        raise ValueError(
+            f"Could not resolve audio for Listen Notes episode {ep_id}: "
+            f"API unreachable and yt-dlp failed ({yt_exc})"
+        ) from yt_exc
 
 
 async def _process_record(
@@ -167,7 +203,31 @@ async def _process_record(
             if not raw_url:
                 await _set_episode_status(record["id"], "error")
                 return _skip(episode_id, title, source, f"No audioLink for source '{source}'")
-            url = await _resolve_audio_url(raw_url, record["listen_notes_api_key"])
+            try:
+                url = await _resolve_audio_url(raw_url, record["listen_notes_api_key"])
+            except ValueError:
+                logger.warning(
+                    "Audio unreachable for episode %s — falling back to text analysis",
+                    episode_id,
+                )
+                analysis = await gemini.analyze_text(
+                    title=record["title"],
+                    channel=record["channel"],
+                    description=record["description"],
+                    person_name=person_name,
+                    name_variations=name_variations,
+                )
+                await _update_episode(record, analysis)
+                return {
+                    "episode_id": episode_id,
+                    "title": title,
+                    "source": source,
+                    "is_podcast": analysis.get("is_podcast"),
+                    "role": analysis.get("role"),
+                    "confidence_score": analysis.get("confidence_score"),
+                    "reason": f"[text-only] {analysis.get('reason')}",
+                    "status": "processed",
+                }
             analysis = await gemini.analyze_audio_url(url, person_name, name_variations)
     except Exception as exc:
         from tenacity import RetryError

@@ -125,6 +125,48 @@ class GeminiService:
         )
         return _extract_json(response.text)
 
+    async def analyze_text(
+        self,
+        title: str,
+        channel: str,
+        description: str,
+        person_name: str,
+        name_variations: list[str],
+    ) -> dict:
+        """Text-only analysis when audio/video is unavailable.
+        Uses episode title, channel name, and description as context."""
+        all_names = [person_name] + [v.strip() for v in name_variations if v.strip()]
+        names_str = ", ".join(f'"{n}"' for n in all_names)
+
+        prompt = f"""Based ONLY on the text metadata below (no audio/video available), answer:
+
+1. Is this a PODCAST episode? A podcast is a recurring audio/video show with a host and guest format.
+2. If yes, is the person known as {names_str} the GUEST or HOST?
+
+Episode title: {title}
+Channel / Show: {channel}
+Description: {description[:1500] if description else "N/A"}
+
+Respond ONLY with a valid JSON object — no markdown, no extra text:
+{{
+  "is_podcast": true or false,
+  "confidence_score": integer from 0 to 100,
+  "role": "guest" or "host" or "unknown" or null,
+  "reason": "one or two sentence explanation"
+}}
+
+Note: since this is text-only analysis, keep confidence_score lower (max 75) to reflect uncertainty.
+Rules:
+- Set "is_podcast" to false for: tutorials, vlogs, ads, music videos, shorts, solo presentations
+- Set "role" to null when "is_podcast" is false
+- Set "role" to "unknown" when the person cannot be clearly identified from the text alone"""
+
+        response = await self.client.aio.models.generate_content(
+            model=MODEL,
+            contents=[types.Part.from_text(text=prompt)],
+        )
+        return _extract_json(response.text)
+
     async def analyze_audio_url(
         self,
         audio_url: str,
