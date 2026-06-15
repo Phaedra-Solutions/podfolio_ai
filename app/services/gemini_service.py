@@ -53,7 +53,9 @@ def _is_token_limit_error(exc: ClientError) -> bool:
 def _is_retryable(exc: Exception) -> bool:
     """Only retry on transient errors (rate limit / server error), not on 4xx."""
     if isinstance(exc, ClientError):
-        return exc.status_code in (429, 500, 502, 503, 504)
+        # ClientError uses .code for the numeric HTTP status
+        code = getattr(exc, "code", None)
+        return code in (429, 500, 502, 503, 504)
     return True
 
 

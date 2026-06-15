@@ -9,9 +9,11 @@ status endpoint always reflects live progress.
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from uuid import UUID
 
+import httpx
 from sqlalchemy import select, text
 
 from app.db.session import AsyncSessionLocal
@@ -63,6 +65,7 @@ async def _run(job_id: UUID) -> None:
                 "video_link": ep.videoLink,
                 "audio_link": ep.audioLink,
                 "meta": dict(ep.meta or {}),
+                "listen_notes_api_key": listen_notes_api_key,
             }
             for ep in episodes
         ]
@@ -112,6 +115,36 @@ async def _run(job_id: UUID) -> None:
     logger.info("Job %s completed — %d processed, %d skipped, %d errors", job_id, processed, skipped, errors)
 
 
+_LN_WEB_RE = re.compile(r"listennotes\.com/podcasts/[^/]+/[^/]+-([A-Za-z0-9_-]+)/?")
+_LN_API = "https://listen-api.listennotes.com/api/v2/episodes/{ep_id}"
+
+
+async def _resolve_audio_url(raw_url: str, ln_api_key: str) -> str:
+    """
+    If raw_url is a Listen Notes web-page URL (returns 403 on direct download),
+    extract the episode ID and call the Listen Notes API to get the real audio URL.
+    Otherwise return raw_url unchanged.
+    """
+    m = _LN_WEB_RE.search(raw_url)
+    if not m:
+        return raw_url  # Already a direct audio URL
+
+    ep_id = m.group(1)
+    api_url = _LN_API.format(ep_id=ep_id)
+
+    async with httpx.AsyncClient(timeout=30) as http:
+        resp = await http.get(api_url, headers={"X-ListenAPI-Key": ln_api_key})
+        resp.raise_for_status()
+        data = resp.json()
+
+    audio = data.get("audio") or data.get("audio_url")
+    if not audio:
+        raise ValueError(f"Listen Notes API returned no audio URL for episode {ep_id}")
+
+    logger.info("Resolved Listen Notes episode %s → %s", ep_id, audio)
+    return audio
+
+
 async def _process_record(
     gemini: GeminiService,
     record: dict,
@@ -130,10 +163,11 @@ async def _process_record(
                 return _skip(episode_id, title, source, "No videoLink available")
             analysis = await gemini.analyze_youtube(url, person_name, name_variations)
         else:
-            url = record["audio_link"]
-            if not url:
+            raw_url = record["audio_link"]
+            if not raw_url:
                 await _set_episode_status(record["id"], "error")
                 return _skip(episode_id, title, source, f"No audioLink for source '{source}'")
+            url = await _resolve_audio_url(raw_url, record["listen_notes_api_key"])
             analysis = await gemini.analyze_audio_url(url, person_name, name_variations)
     except Exception as exc:
         from tenacity import RetryError
@@ -144,6 +178,7 @@ async def _process_record(
             "is_podcast": None, "role": None, "confidence_score": None,
             "reason": str(cause), "status": "error",
         }
+
 
     await _update_episode(record, analysis)
 
