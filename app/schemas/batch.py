@@ -33,7 +33,7 @@ class JobStatusResponse(BaseModel):
     job_id: UUID
     batch_number: UUID
     person_name: str
-    status: str = Field(..., description="queued | running | completed | failed")
+    status: str = Field(..., description="queued | running | completed | failed | interrupted")
     total_episodes: int
     processed: int
     skipped: int

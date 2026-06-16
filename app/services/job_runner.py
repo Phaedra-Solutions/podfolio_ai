@@ -50,7 +50,7 @@ async def _run(job_id: UUID) -> None:
         youtube_api_key = job.youtube_api_key
         listen_notes_api_key = job.listen_notes_api_key
 
-    # ── 2. Fetch episodes ───────────────────────────────────────────────────
+    # ── 2. Fetch all episodes in the batch ──────────────────────────────────
     async with AsyncSessionLocal() as db:
         ep_result = await db.execute(
             select(Episode).where(Episode.batchNumber == batch_number)
@@ -73,48 +73,95 @@ async def _run(job_id: UUID) -> None:
         ]
 
     total = len(records)
+    CONCURRENCY = 5  # parallel Gemini calls at once
 
     # ── 3. Mark running ─────────────────────────────────────────────────────
     await _update_job(job_id, status="running", total_episodes=total, started_at=datetime.now(timezone.utc))
+    logger.info("🚀 Job %s started — person: %s | episodes: %d | concurrency: %d", job_id, person_name, total, CONCURRENCY)
 
-    # ── 4. Process each episode ─────────────────────────────────────────────
-    results: list[dict] = []
-    processed = skipped = errors = 0
+    # ── 4. Process episodes in parallel ─────────────────────────────────────
+    results: list[dict] = [None] * total
+    processed = skipped = errors = done_count = 0
+    sem = asyncio.Semaphore(CONCURRENCY)
+    lock = asyncio.Lock()
 
-    for record in records:
-        # Mark episode as "processing" before the Gemini call
-        await _set_episode_status(record["id"], "processing")
-        ep_result = await _process_record(gemini, record, person_name, name_variations)
-        results.append(ep_result)
+    async def _handle(idx: int, record: dict) -> None:
+        nonlocal processed, skipped, errors, done_count
 
-        match ep_result["status"]:
-            case "processed":
-                processed += 1
-            case "skipped":
-                skipped += 1
-            case _:
-                errors += 1
+        title_short = (record["title"] or "")[:60]
+        async with sem:
+            logger.info("[%d/%d] Processing: \"%s\" (%s)", idx + 1, total, title_short, record["source"])
+            await _set_episode_status(record["id"], "processing")
+            try:
+                ep_result = await asyncio.wait_for(
+                    _process_record(gemini, record, person_name, name_variations),
+                    timeout=180,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[%d/%d] ⏱️  Timeout — falling back to text: \"%s\"", idx + 1, total, title_short)
+                analysis = await gemini.analyze_text(
+                    title=record["title"],
+                    channel=record["channel"],
+                    description=record["description"],
+                    person_name=person_name,
+                    name_variations=name_variations,
+                )
+                await _update_episode(record, analysis)
+                ep_result = {
+                    "episode_id": record["id_str"],
+                    "title": record["title"],
+                    "source": record["source"],
+                    "is_podcast": analysis.get("is_podcast"),
+                    "role": analysis.get("role"),
+                    "confidence_score": analysis.get("confidence_score"),
+                    "reason": f"[timeout→text] {analysis.get('reason')}",
+                    "status": "processed",
+                }
 
-        # Persist progress after every episode
-        await _update_job(
-            job_id,
-            processed=processed,
-            skipped=skipped,
-            errors=errors,
-            results=results,
-        )
+        results[idx] = ep_result
+
+        async with lock:
+            match ep_result["status"]:
+                case "processed":
+                    processed += 1
+                    logger.info(
+                        "  ✅ [%d/%d] is_podcast=%s | role=%s | confidence=%s | \"%s\"",
+                        idx + 1, total, ep_result.get("is_podcast"), ep_result.get("role"),
+                        ep_result.get("confidence_score"), title_short,
+                    )
+                case "skipped":
+                    skipped += 1
+                    logger.info("  ⏭️  [%d/%d] Skipped: \"%s\"", idx + 1, total, title_short)
+                case _:
+                    errors += 1
+                    logger.warning("  ❌ [%d/%d] Error on \"%s\": %s", idx + 1, total, title_short, ep_result.get("reason", ""))
+
+            done_count += 1
+            pct = round((done_count / total) * 100, 1) if total else 0
+            logger.info(
+                "  Progress: %d/%d (%.1f%%) — ✅ %d | ⏭️  %d | ❌ %d",
+                done_count, total, pct, processed, skipped, errors,
+            )
+            completed_results = [r for r in results if r is not None]
+            await _update_job(job_id, processed=processed, skipped=skipped, errors=errors, results=completed_results)
+
+    await asyncio.gather(*[_handle(i, rec) for i, rec in enumerate(records)])
 
     # ── 5. Mark completed ───────────────────────────────────────────────────
+    final_results = [r for r in results if r is not None]
     await _update_job(
         job_id,
         status="completed",
         processed=processed,
         skipped=skipped,
         errors=errors,
-        results=results,
+        results=final_results,
         completed_at=datetime.now(timezone.utc),
     )
-    logger.info("Job %s completed — %d processed, %d skipped, %d errors", job_id, processed, skipped, errors)
+    logger.info(
+        "🎉 Job %s COMPLETED — %d processed | %d skipped | %d errors (total: %d)",
+        job_id, processed, skipped, errors, total,
+    )
 
 
 _LN_PODCASTS_RE = re.compile(r"listennotes\.com/podcasts/[^/]+/[^/]+-([A-Za-z0-9_-]+)/?")
@@ -197,7 +244,33 @@ async def _process_record(
             if not url:
                 await _set_episode_status(record["id"], "error")
                 return _skip(episode_id, title, source, "No videoLink available")
-            analysis = await gemini.analyze_youtube(url, person_name, name_variations)
+            try:
+                analysis = await gemini.analyze_youtube(url, person_name, name_variations)
+            except Exception as yt_exc:
+                from tenacity import RetryError
+                cause = yt_exc.__cause__ if isinstance(yt_exc, RetryError) else yt_exc
+                logger.warning(
+                    "YouTube video unreachable for episode %s (%s) — falling back to text analysis",
+                    episode_id, cause,
+                )
+                analysis = await gemini.analyze_text(
+                    title=record["title"],
+                    channel=record["channel"],
+                    description=record["description"],
+                    person_name=person_name,
+                    name_variations=name_variations,
+                )
+                await _update_episode(record, analysis)
+                return {
+                    "episode_id": episode_id,
+                    "title": title,
+                    "source": source,
+                    "is_podcast": analysis.get("is_podcast"),
+                    "role": analysis.get("role"),
+                    "confidence_score": analysis.get("confidence_score"),
+                    "reason": f"[text-only] {analysis.get('reason')}",
+                    "status": "processed",
+                }
         else:
             raw_url = record["audio_link"]
             if not raw_url:
