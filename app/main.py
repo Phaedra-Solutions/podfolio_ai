@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
                     "🔄 Auto-resuming interrupted job %s (batch %s)",
                     job_id, batch_number,
                 )
-                asyncio.create_task(job_runner.start_job(job_id))
+                asyncio.create_task(job_runner.start_job(job_id, resume=True))
         else:
             logger.info("✅ No interrupted jobs to resume on startup")
 

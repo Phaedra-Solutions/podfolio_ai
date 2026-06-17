@@ -125,6 +125,11 @@ class GeminiService:
         )
         return _extract_json(response.text)
 
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        retry=retry_if_exception(_is_retryable),
+    )
     async def analyze_text(
         self,
         title: str,

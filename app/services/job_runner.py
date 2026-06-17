@@ -24,16 +24,20 @@ from app.services.gemini_service import GeminiService
 logger = logging.getLogger(__name__)
 
 
-async def start_job(job_id: UUID) -> None:
-    """Entry point called via asyncio.create_task()."""
+async def start_job(job_id: UUID, resume: bool = False) -> None:
+    """Entry point called via asyncio.create_task().
+    
+    resume=True: skip already verified/rejected episodes (used on auto-resume after restart)
+    resume=False: process all episodes fresh (used on manual re-submit)
+    """
     try:
-        await _run(job_id)
+        await _run(job_id, resume=resume)
     except Exception as exc:
         logger.exception("Unhandled error in batch job %s", job_id)
         await _mark_failed(job_id, str(exc))
 
 
-async def _run(job_id: UUID) -> None:
+async def _run(job_id: UUID, resume: bool = False) -> None:
     gemini = GeminiService()
 
     # ── 1. Load job record ──────────────────────────────────────────────────
@@ -50,11 +54,18 @@ async def _run(job_id: UUID) -> None:
         youtube_api_key = job.youtube_api_key
         listen_notes_api_key = job.listen_notes_api_key
 
-    # ── 2. Fetch all episodes in the batch ──────────────────────────────────
+    # ── 2. Fetch episodes ───────────────────────────────────────────────────
     async with AsyncSessionLocal() as db:
-        ep_result = await db.execute(
-            select(Episode).where(Episode.batchNumber == batch_number)
-        )
+        query = select(Episode).where(Episode.batchNumber == batch_number)
+
+        if resume:
+            # Skip already completed episodes — resume from checkpoint
+            query = query.where(
+                Episode.processingStatus.notin_(["verified", "rejected"])
+            )
+            logger.info("🔄 Resuming job %s — skipping already processed episodes", job_id)
+
+        ep_result = await db.execute(query)
         episodes = ep_result.scalars().all()
         records = [
             {
@@ -73,7 +84,7 @@ async def _run(job_id: UUID) -> None:
         ]
 
     total = len(records)
-    CONCURRENCY = 1  # sequential — increase only if server has sufficient resources
+    CONCURRENCY = 5  # parallel Gemini calls at once
 
     # ── 3. Mark running ─────────────────────────────────────────────────────
     await _update_job(job_id, status="running", total_episodes=total, started_at=datetime.now(timezone.utc))
