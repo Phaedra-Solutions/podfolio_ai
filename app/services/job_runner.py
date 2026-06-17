@@ -16,6 +16,7 @@ from uuid import UUID
 import httpx
 from sqlalchemy import select, text
 
+from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.batch_job import BatchJob
 from app.models.episode import Episode
@@ -37,8 +38,21 @@ async def start_job(job_id: UUID, resume: bool = False) -> None:
         await _mark_failed(job_id, str(exc))
 
 
+def _get_openai_service():
+    """Return OpenAI service if key is configured, else None."""
+    if not settings.OPENAI_API_KEY:
+        return None
+    try:
+        from app.services.openai_service import OpenAIService
+        return OpenAIService()
+    except Exception as exc:
+        logger.warning("OpenAI service unavailable: %s", exc)
+        return None
+
+
 async def _run(job_id: UUID, resume: bool = False) -> None:
     gemini = GeminiService()
+    openai_svc = _get_openai_service()
 
     # ── 1. Load job record ──────────────────────────────────────────────────
     async with AsyncSessionLocal() as db:
@@ -96,7 +110,7 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
     sem = asyncio.Semaphore(CONCURRENCY)
     lock = asyncio.Lock()
 
-    async def _handle(idx: int, record: dict) -> None:
+    async def _handle(idx: int, record: dict, openai_svc=None) -> None:
         nonlocal processed, skipped, errors, done_count
 
         title_short = (record["title"] or "")[:60]
@@ -108,6 +122,48 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
                     _process_record(gemini, record, person_name, name_variations),
                     timeout=180,
                 )
+            except Exception as proc_exc:
+                # Check if Gemini hit quota limit → try OpenAI fallback
+                from tenacity import RetryError
+                cause = proc_exc.__cause__ if isinstance(proc_exc, RetryError) else proc_exc
+                is_quota = getattr(cause, "code", None) == 429
+
+                if is_quota and openai_svc:
+                    logger.warning(
+                        "[%d/%d] ⚡ Gemini quota hit — switching to OpenAI for \"%s\"",
+                        idx + 1, total, title_short,
+                    )
+                    try:
+                        analysis = await openai_svc.analyze_text(
+                            title=record["title"],
+                            channel=record["channel"],
+                            description=record["description"],
+                            person_name=person_name,
+                            name_variations=name_variations,
+                        )
+                        await _update_episode(record, analysis)
+                        ep_result = {
+                            "episode_id": record["id_str"],
+                            "title": record["title"],
+                            "source": record["source"],
+                            "is_podcast": analysis.get("is_podcast"),
+                            "role": analysis.get("role"),
+                            "confidence_score": analysis.get("confidence_score"),
+                            "reason": f"[openai-fallback] {analysis.get('reason')}",
+                            "status": "processed",
+                        }
+                    except Exception as oai_exc:
+                        logger.error("OpenAI fallback also failed: %s", oai_exc)
+                        await _set_episode_status(record["id"], "error")
+                        ep_result = {
+                            "episode_id": record["id_str"], "title": record["title"],
+                            "source": record["source"], "is_podcast": None,
+                            "role": None, "confidence_score": None,
+                            "reason": f"Gemini quota exceeded and OpenAI fallback failed: {oai_exc}",
+                            "status": "error",
+                        }
+                else:
+                    raise proc_exc
             except asyncio.TimeoutError:
                 logger.warning("[%d/%d] ⏱️  Timeout — falling back to text: \"%s\"", idx + 1, total, title_short)
                 analysis = await gemini.analyze_text(
@@ -156,7 +212,7 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
             completed_results = [r for r in results if r is not None]
             await _update_job(job_id, processed=processed, skipped=skipped, errors=errors, results=completed_results)
 
-    await asyncio.gather(*[_handle(i, rec) for i, rec in enumerate(records)])
+    await asyncio.gather(*[_handle(i, rec, openai_svc) for i, rec in enumerate(records)])
 
     # ── 5. Mark completed ───────────────────────────────────────────────────
     final_results = [r for r in results if r is not None]

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 
     GEMINI_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
 
     @property
     def async_database_url(self) -> str:
