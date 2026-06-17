@@ -201,7 +201,14 @@ Rules:
         prompt = _build_prompt(person_name, name_variations)
 
         async with httpx.AsyncClient(timeout=120) as http:
-            resp = await http.get(audio_url, follow_redirects=True)
+            resp = await http.get(
+                audio_url,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; PodcastBot/1.0)",
+                    "Referer": "https://www.listennotes.com/",
+                },
+            )
             resp.raise_for_status()
             audio_bytes = resp.content
 

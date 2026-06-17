@@ -73,7 +73,7 @@ async def _run(job_id: UUID) -> None:
         ]
 
     total = len(records)
-    CONCURRENCY = 5  # parallel Gemini calls at once
+    CONCURRENCY = 1  # sequential — increase only if server has sufficient resources
 
     # ── 3. Mark running ─────────────────────────────────────────────────────
     await _update_job(job_id, status="running", total_episodes=total, started_at=datetime.now(timezone.utc))
