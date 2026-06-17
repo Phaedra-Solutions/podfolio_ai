@@ -67,6 +67,12 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
         name_variations = [v.strip() for v in (job.name_variations or "").split(",") if v.strip()]
         youtube_api_key = job.youtube_api_key
         listen_notes_api_key = job.listen_notes_api_key
+        # Preserve existing results and counters when resuming
+        prior_results = list(job.results or [])
+        prior_processed = job.processed or 0
+        prior_skipped = job.skipped or 0
+        prior_errors = job.errors or 0
+        original_total = job.total_episodes or 0
 
     # ── 2. Fetch episodes ───────────────────────────────────────────────────
     async with AsyncSessionLocal() as db:
@@ -77,7 +83,10 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
             query = query.where(
                 Episode.processingStatus.notin_(["verified", "rejected"])
             )
-            logger.info("🔄 Resuming job %s — skipping already processed episodes", job_id)
+            logger.info(
+                "🔄 Resuming job %s — %d already done, picking up remaining",
+                job_id, prior_processed + prior_skipped + prior_errors,
+            )
 
         ep_result = await db.execute(query)
         episodes = ep_result.scalars().all()
@@ -100,13 +109,21 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
     total = len(records)
     CONCURRENCY = 5  # parallel Gemini calls at once
 
-    # ── 3. Mark running ─────────────────────────────────────────────────────
-    await _update_job(job_id, status="running", total_episodes=total, started_at=datetime.now(timezone.utc))
-    logger.info("🚀 Job %s started — person: %s | episodes: %d | concurrency: %d", job_id, person_name, total, CONCURRENCY)
+    # ── 3. Mark running — preserve original total, seed counters from prior run ──
+    effective_total = original_total if resume and original_total > 0 else total
+    await _update_job(job_id, status="running", total_episodes=effective_total, started_at=datetime.now(timezone.utc))
+    logger.info(
+        "🚀 Job %s started — person: %s | remaining: %d / %d | concurrency: %d",
+        job_id, person_name, total, effective_total, CONCURRENCY,
+    )
 
-    # ── 4. Process episodes in parallel ─────────────────────────────────────
+    # ── 4. Process episodes ─────────────────────────────────────────────────
     results: list[dict] = [None] * total
-    processed = skipped = errors = done_count = 0
+    # Seed counters from previous run so progress is continuous
+    processed = prior_processed
+    skipped = prior_skipped
+    errors = prior_errors
+    done_count = prior_processed + prior_skipped + prior_errors
     sem = asyncio.Semaphore(CONCURRENCY)
     lock = asyncio.Lock()
 
@@ -209,13 +226,14 @@ async def _run(job_id: UUID, resume: bool = False) -> None:
                 "  Progress: %d/%d (%.1f%%) — ✅ %d | ⏭️  %d | ❌ %d",
                 done_count, total, pct, processed, skipped, errors,
             )
-            completed_results = [r for r in results if r is not None]
-            await _update_job(job_id, processed=processed, skipped=skipped, errors=errors, results=completed_results)
+            new_results = [r for r in results if r is not None]
+            merged_results = prior_results + new_results
+            await _update_job(job_id, processed=processed, skipped=skipped, errors=errors, results=merged_results)
 
     await asyncio.gather(*[_handle(i, rec, openai_svc) for i, rec in enumerate(records)])
 
     # ── 5. Mark completed ───────────────────────────────────────────────────
-    final_results = [r for r in results if r is not None]
+    final_results = prior_results + [r for r in results if r is not None]
     await _update_job(
         job_id,
         status="completed",
